@@ -5,3 +5,9 @@ use crate::prelude::*;
 fn resolver() {
     (None, None)
 }
+
+#[count(Todo)]
+fn resolver() {
+    // TODO:
+    None
+}
