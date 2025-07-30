@@ -3,7 +3,7 @@ use serde_json::to_string as json;
 
 // create a sea orm model and graphql object
 // id, created_at, updated_at... will be inserted automatically
-#[model(no_by_id = true, no_deleted_at = true)]
+#[model]
 pub struct Todo {
     pub content: String,
     pub done: bool,
@@ -53,7 +53,7 @@ pub struct TodoCreate {
 #[create(Todo)]
 fn resolver() {
     println!("todoCreate data={}", json(&data)?);
-    active_create!(Todo {
+    am_create!(Todo {
         content: data.content
     })
 }
@@ -66,19 +66,22 @@ pub struct TodoUpdate {
 #[update(Todo)]
 fn resolver() {
     println!("todoUpdate id={} data={}", id, json(&data)?);
-    active_update!(Todo {
+    Todo::try_exists_by_id(tx, &id).await?;
+    am_update!(Todo {
         id: id.clone(),
         content: data.content
     })
 }
 
-// custom resolver name and inputs
-#[update(Todo, resolver_inputs = true)]
-fn todoUpdateDone(id: String, done: bool) {
-    println!("todoUpdateDone id={} done={}", id, done);
-    active_update!(Todo {
+// toggle a Todo done using update macro
+// with custom resolver name and inputs
+#[update(Todo, resolver_inputs)]
+fn todoToggleDone(id: String) {
+    println!("todoToggleDone id={}", id);
+    let todo = Todo::try_find_by_id(tx, &id).await?;
+    am_update!(Todo {
         id: id.clone(),
-        done,
+        done: !todo.done,
     })
 }
 
@@ -92,13 +95,15 @@ fn resolver() {
 #[query]
 fn todoCountDone() -> u64 {
     let f = filter!(Todo { done: true });
-    f.query().count(tx).await?
+    f.select().count(tx).await?
 }
 
 // manual mutation: delete all done Todo
 #[mutation]
 fn todoDeleteDone() -> Vec<TodoGql> {
-    let arr = Todo::gql_select_id(filter!(Todo { done: true }).query())
+    let arr = filter!(Todo { done: true })
+        .select()
+        .gql_select_id()
         .all(tx)
         .await?;
     let f = filter!(Todo {
@@ -108,11 +113,33 @@ fn todoDeleteDone() -> Vec<TodoGql> {
     arr
 }
 
-use async_graphql::{EmptySubscription, MergedObject, Schema};
+// ----------------------------------------------------------------------------
+// main axum listener
+
 use async_graphql_axum::GraphQL;
-use axum::{routing::get_service, serve, Router};
-use std::sync::Arc;
+use axum::{Router, routing::get_service, serve};
 use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let svc = GraphQL::new(schema(&db().await?));
+    let router = get_service(svc.clone()).post_service(svc);
+    let app = Router::new().route("/api/graphql", router);
+
+    let port = 4000;
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(addr).await?;
+
+    println!("listening on port {}", port);
+    serve(listener, app).await?;
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// init schema
+
+use async_graphql::{EmptySubscription, MergedObject, Schema};
 
 #[derive(Default, MergedObject)]
 struct Query(
@@ -127,63 +154,43 @@ struct Query(
 struct Mutation(
     TodoCreateMutation,
     TodoUpdateMutation,
-    TodoUpdateDoneMutation,
+    TodoToggleDoneMutation,
     TodoDeleteMutation,
     TodoDeleteDoneMutation,
 );
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt::Subscriber::builder()
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
-
-    let schema = Schema::build(Query::default(), Mutation::default(), EmptySubscription)
+fn schema(db: &DatabaseConnection) -> Schema<Query, Mutation, EmptySubscription> {
+    Schema::build(Query::default(), Mutation::default(), EmptySubscription)
         .extension(GrandLineExtension)
-        .data(Arc::new(init_db().await?))
-        .finish();
-
-    let svc = GraphQL::new(schema);
-    let app = Router::new().route("/api/graphql", get_service(svc.clone()).post_service(svc));
-
-    let port = 4000;
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = TcpListener::bind(addr).await?;
-
-    println!("listening on port {}", port);
-    serve(listener, app).await?;
-
-    Ok(())
+        .data(Arc::new(db.clone()))
+        .finish()
 }
 
-async fn init_db() -> Result<DatabaseConnection, Box<dyn Error>> {
+// ----------------------------------------------------------------------------
+// init db
+
+async fn db() -> Result<DatabaseConnection, Box<dyn Error>> {
     let db = Database::connect("sqlite::memory:").await?;
 
-    db.execute_unprepared(
-        "CREATE TABLE todo (
-            id TEXT PRIMARY KEY NOT NULL
-            , content TEXT NOT NULL
-            , done INT(1) NOT NULL
-            , created_at TEXT NOT NULL
-            , updated_at TEXT
-        );",
-    )
-    .await?;
+    let backend = db.get_database_backend();
+    let schema = sea_orm::Schema::new(backend);
+    let stmt = schema.create_table_from_entity(Todo);
+    db.execute(backend.build(&stmt)).await?;
 
     Todo::insert_many(vec![
-        active_create!(Todo {
+        am_create!(Todo {
             content: "2023 good bye",
             done: true,
         }),
-        active_create!(Todo {
+        am_create!(Todo {
             content: "2023 great",
             done: true,
         }),
-        active_create!(Todo {
+        am_create!(Todo {
             content: "2024 hello",
             done: false,
         }),
-        active_create!(Todo {
+        am_create!(Todo {
             content: "2024 awesome",
             done: false,
         }),
